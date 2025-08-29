@@ -141,7 +141,7 @@
         .then(response => response.json())
         .then(data => {
           // Update measured angle
-          document.getElementById("measuredAngle").innerHTML = "Measured Angle: " + data.angle.toFixed(1) + " ";
+          document.getElementById("measuredAngle").innerHTML = "Measured Angle: " + data.angle.toFixed(2) + " ";
           
           // Update sensor status
           const statusElement = document.getElementById("sensorStatus");
@@ -180,7 +180,7 @@
     }
     
     // Fetch measured angle every second
-    setInterval(fetchMeasuredAngle, 1000);
+    setInterval(fetchMeasuredAngle, 200);
     
     // Initial fetch on page load
     document.addEventListener("DOMContentLoaded", fetchMeasuredAngle);

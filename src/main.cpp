@@ -3,10 +3,14 @@
 #include <WebServer.h>
 #include <EEPROM.h>
 #include <SPIFFS.h>
-// 添加 MPU6050 相关库
 #include <Adafruit_MPU6050.h>
 #include <Adafruit_Sensor.h>
 #include <Wire.h>
+
+// Add FreeRTOS includes
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/semphr.h"
 
 // Servo control parameters
 #define SERVO_PIN 1         // GPIO 1 for servo control
@@ -34,6 +38,12 @@
 #define MAX_SSID_LENGTH 32
 #define MAX_PASSWORD_LENGTH 64
 
+// FreeRTOS task definitions
+#define WEBSERVER_TASK_PRIORITY 3
+#define MPU_TASK_PRIORITY 2
+#define LED_TASK_PRIORITY 1
+#define STACK_SIZE 4096
+
 // Web server
 WebServer server(80);
 
@@ -45,16 +55,19 @@ bool wifiConfigured = false;
 unsigned long lastLedToggle = 0;
 int ledBlinkInterval = 1000; // Default blink interval
 bool ledState = false;       // LED state
-unsigned long restartTime = 0;
 bool restartPending = false;
+unsigned long restartTime = 0;
 
-// 添加 MPU6050 相关全局变量
+// MPU6050 variables
 Adafruit_MPU6050 mpu;
-unsigned long lastMpuReadTime = 0;
-const int MPU_READ_INTERVAL = 100;  // 读取间隔 (毫秒)
-float measuredAngle = 90;           // 初始值与舵机默认角度相同
-const float FILTER_FACTOR = 0.1;    // 平滑角度数据的滤波系数 (0-1)
-bool mpuInitialized = false;        // MPU6050 初始化状态
+float measuredAngle = 90;           // Initial value matching default servo angle
+const float FILTER_FACTOR = 0.25;    // Low-pass filter coefficient (0-1)
+bool mpuInitialized = false;        // MPU6050 initialization status
+
+// FreeRTOS synchronization
+SemaphoreHandle_t angleMutex;
+SemaphoreHandle_t wifiMutex;
+SemaphoreHandle_t ledMutex;
 
 // Structure to store WiFi configuration
 struct {
@@ -62,6 +75,19 @@ struct {
   char password[MAX_PASSWORD_LENGTH] = {0};
   bool configured = false;
 } wifiConfig;
+
+// Function prototypes
+void webServerTask(void *parameter);
+void mpuTask(void *parameter);
+void ledControlTask(void *parameter);
+void setServoAngle(int angle);
+float readMPUAngle();
+bool initMPU6050();
+float mapFloat();
+
+float mapFloat(float x, float in_min, float in_max, float out_min, float out_max) {
+  return (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min;
+}
 
 // Function to read a file from SPIFFS
 String readFile(const char* path) {
@@ -81,40 +107,29 @@ String readFile(const char* path) {
 
 // LED control functions
 void setLedMode(int blinkInterval) {
-  ledBlinkInterval = blinkInterval;
-  lastLedToggle = millis();
+  if (xSemaphoreTake(ledMutex, portMAX_DELAY)) {
+    ledBlinkInterval = blinkInterval;
+    lastLedToggle = millis();
+    xSemaphoreGive(ledMutex);
+  }
 }
 
 void turnLedOn() {
-  digitalWrite(LED_PIN, LOW); // LOW turns on the LED on most ESP32 boards
-  ledState = true;
+  if (xSemaphoreTake(ledMutex, portMAX_DELAY)) {
+    digitalWrite(LED_PIN, LOW); // LOW turns on the LED on most ESP32 boards
+    ledState = true;
+    ledBlinkInterval = 0;
+    xSemaphoreGive(ledMutex);
+  }
 }
 
 void turnLedOff() {
-  digitalWrite(LED_PIN, HIGH); // HIGH turns off the LED on most ESP32 boards
-  ledState = false;
-}
-
-void blinkLed() {
-  if (ledBlinkInterval == 0) {
-    // Solid on
-    turnLedOn();
-    return;
+  if (xSemaphoreTake(ledMutex, portMAX_DELAY)) {
+    digitalWrite(LED_PIN, HIGH); // HIGH turns off the LED on most ESP32 boards
+    ledState = false;
+    ledBlinkInterval = 0;
+    xSemaphoreGive(ledMutex);
   }
-  
-  unsigned long currentMillis = millis();
-  if (currentMillis - lastLedToggle >= ledBlinkInterval) {
-    lastLedToggle = currentMillis;
-    ledState = !ledState;
-    digitalWrite(LED_PIN, ledState ? LOW : HIGH);
-  }
-}
-
-void pulseServoLed() {
-  // Quick pulse to indicate servo movement
-  turnLedOff();
-  delay(LED_SERVO_ACTIVE);
-  turnLedOn();
 }
 
 // Convert angle to PWM value
@@ -122,30 +137,37 @@ int angleToPulse(int angle) {
   return map(angle, 0, 180, SERVO_MIN_PULSE, SERVO_MAX_PULSE);
 }
 
-// Set servo angle
+// Set servo angle with thread safety
 void setServoAngle(int angle) {
-  // Limit angle to valid range
-  if (angle < 0) angle = 0;
-  if (angle > 180) angle = 180;
-  
-  // Convert angle to PWM value and write
-  int pulse = angleToPulse(angle);
-  ledcWrite(LEDC_CHANNEL, pulse);
-  currentServoAngle = angle;
-  
-  // Flash LED to indicate servo movement
-  pulseServoLed();
-  
-  Serial.print("Servo angle set to: ");
-  Serial.print(angle);
-  Serial.print(" (PWM value: ");
-  Serial.print(pulse);
-  Serial.println(")");
+  // Take mutex to ensure thread safety
+  if (xSemaphoreTake(angleMutex, portMAX_DELAY)) {
+    // Limit angle to valid range
+    if (angle < 0) angle = 0;
+    if (angle > 180) angle = 180;
+    
+    // Convert angle to PWM value and write
+    int pulse = angleToPulse(angle);
+    ledcWrite(LEDC_CHANNEL, pulse);
+    currentServoAngle = angle;
+    
+    // Indicate servo movement with LED (non-blocking)
+    digitalWrite(LED_PIN, HIGH); // Briefly turn off
+    vTaskDelay(pdMS_TO_TICKS(10)); // Non-blocking delay
+    digitalWrite(LED_PIN, LOW);  // Turn back on
+    
+    Serial.print("Servo angle set to: ");
+    Serial.print(angle);
+    Serial.print(" (PWM value: ");
+    Serial.print(pulse);
+    Serial.println(")");
+    
+    xSemaphoreGive(angleMutex);
+  }
 }
 
-// MPU6050 初始化函数
+// MPU6050 initialization function
 bool initMPU6050() {
-  // 使用指定的 SDA 和 SCL 引脚初始化 I2C
+  // Initialize I2C with specified SDA and SCL pins
   Wire.begin(SDA_PIN, SCL_PIN);
   
   if (!mpu.begin()) {
@@ -155,35 +177,40 @@ bool initMPU6050() {
   
   Serial.println("MPU6050 Found!");
   
-  // 设置加速度计范围 (±2, 4, 8, or 16 G)
+  // Configure accelerometer range (±2, 4, 8, or 16 G)
   mpu.setAccelerometerRange(MPU6050_RANGE_2_G);
-  // 设置陀螺仪范围 (250, 500, 1000, or 2000 度/秒)
-  mpu.setGyroRange(MPU6050_RANGE_250_DEG);
-  // 设置滤波带宽 (5, 10, 21, 44, 94, 184, 260 Hz)
-  mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+  // Configure gyroscope range (250, 500, 1000, or 2000 degrees/second)
+  mpu.setGyroRange(MPU6050_RANGE_1000_DEG);
+  // Configure filter bandwidth (5, 10, 21, 44, 94, 184, 260 Hz)
+  mpu.setFilterBandwidth(MPU6050_BAND_44_HZ);
   
-  delay(100);
+  vTaskDelay(pdMS_TO_TICKS(100));
   return true;
 }
 
-// 读取 MPU6050 角度数据
+// Read MPU6050 angle data
 float readMPUAngle() {
   if (!mpuInitialized) return measuredAngle;
   
-  sensors_event_t a, g, temp;
-  mpu.getEvent(&a, &g, &temp);
+  float result = 0;
   
-  // 计算基于加速度计的倾角（假设安装方向与舵面方向匹配）
-  // 这里假设 MPU6050 的 X 轴与舵面旋转轴垂直
-  float angleX = atan2(a.acceleration.y, a.acceleration.z) * 180.0 / PI;
+  if (xSemaphoreTake(angleMutex, portMAX_DELAY)) {
+    sensors_event_t a, g, temp;
+    mpu.getEvent(&a, &g, &temp);
+    
+    // Calculate tilt angle based on accelerometer data
+    float angleX = atan2(a.acceleration.y, a.acceleration.z) * 180.0 / PI;
+    
+    // Apply low-pass filter for smoother readings
+    measuredAngle = measuredAngle * (1.0 - FILTER_FACTOR) + angleX * FILTER_FACTOR;
+    
+    // Map to 0-180 degree range
+    result = mapFloat(constrain(measuredAngle, -90.0f, 90.0f), -90.0f, 90.0f, 0.0f, 180.0f);
+    
+    xSemaphoreGive(angleMutex);
+  }
   
-  // 应用低通滤波平滑数据
-  measuredAngle = measuredAngle * (1.0 - FILTER_FACTOR) + angleX * FILTER_FACTOR;
-  
-  // 映射到 0-180 度范围
-  float mappedAngle = map(constrain(measuredAngle, -90, 90), -90, 90, 0, 180);
-  
-  return mappedAngle;
+  return result;
 }
 
 // Load WiFi configuration from EEPROM
@@ -237,9 +264,8 @@ bool connectToWiFi() {
   
   int attempts = 0;
   while (WiFi.status() != WL_CONNECTED && attempts < 20) {
-    delay(500);
+    vTaskDelay(pdMS_TO_TICKS(500));
     Serial.print(".");
-    blinkLed(); // Update LED while waiting
     attempts++;
   }
   
@@ -250,7 +276,6 @@ bool connectToWiFi() {
     
     // Set LED to solid ON for connected state
     turnLedOn();
-    ledBlinkInterval = 0; // Solid on
     
     return true;
   } else {
@@ -274,34 +299,38 @@ void handleWiFiConfig() {
   server.send(200, "text/html", html);
 }
 
-// 处理获取实际角度的请求
+// Handle measured angle requests
 void handleGetMeasuredAngle() {
   float angle = readMPUAngle();
-  server.send(200, "application/json", "{\"angle\":" + String(angle, 1) + ", \"status\":" + String(mpuInitialized ? "true" : "false") + "}");
+  server.send(200, "application/json", "{\"angle\":" + String(angle, 2) + ", \"status\":" + String(mpuInitialized ? "true" : "false") + "}");
 }
 
-// Save WiFi configuration and try to connect
+// Save WiFi configuration
 void handleSaveWiFi() {
   String ssid = server.arg("ssid");
   String password = server.arg("password");
   
-  // Save configuration (添加安全保障：确保字符串以null结尾)
-  strncpy(wifiConfig.ssid, ssid.c_str(), MAX_SSID_LENGTH - 1);
-  wifiConfig.ssid[MAX_SSID_LENGTH - 1] = '\0';
-  
-  strncpy(wifiConfig.password, password.c_str(), MAX_PASSWORD_LENGTH - 1);
-  wifiConfig.password[MAX_PASSWORD_LENGTH - 1] = '\0';
-  
-  wifiConfig.configured = true;
-  saveWiFiConfig();
+  if (xSemaphoreTake(wifiMutex, portMAX_DELAY)) {
+    // Save configuration with proper null termination
+    strncpy(wifiConfig.ssid, ssid.c_str(), MAX_SSID_LENGTH - 1);
+    wifiConfig.ssid[MAX_SSID_LENGTH - 1] = '\0';
+    
+    strncpy(wifiConfig.password, password.c_str(), MAX_PASSWORD_LENGTH - 1);
+    wifiConfig.password[MAX_PASSWORD_LENGTH - 1] = '\0';
+    
+    wifiConfig.configured = true;
+    saveWiFiConfig();
+    
+    xSemaphoreGive(wifiMutex);
+  }
   
   String html = readFile("/wifi_save.html");
   server.send(200, "text/html", html);
   
-  // 设置重启标志而不是立即重启
-  restartTime = millis();
-  restartPending = true;
+  // Schedule restart with LED indication
   setLedMode(100);
+  restartPending = true;
+  restartTime = millis();
 }
 
 // Set servo angle handler
@@ -315,29 +344,72 @@ void handleSetAngle() {
   }
 }
 
+// Web server task
+void webServerTask(void *parameter) {
+  for (;;) {
+    server.handleClient();
+    vTaskDelay(pdMS_TO_TICKS(1)); // Small delay to prevent watchdog triggers
+  }
+}
+
+// MPU sensor reading task
+void mpuTask(void *parameter) {
+  const TickType_t xDelay = pdMS_TO_TICKS(20); // 100ms reading interval
+  
+  for (;;) {
+    if (mpuInitialized) {
+      readMPUAngle(); // Read and update angle measurement
+    }
+    vTaskDelay(xDelay);
+  }
+}
+
+// LED control task
+void ledControlTask(void *parameter) {
+  const TickType_t xDelay = pdMS_TO_TICKS(5000); // 50ms for LED control
+  
+  for (;;) {
+    if (xSemaphoreTake(ledMutex, portMAX_DELAY)) {
+      // Check if blinking is required
+      if (ledBlinkInterval > 0) {
+        unsigned long currentMillis = millis();
+        if (currentMillis - lastLedToggle >= ledBlinkInterval) {
+          lastLedToggle = currentMillis;
+          ledState = !ledState;
+          digitalWrite(LED_PIN, ledState ? LOW : HIGH);
+        }
+      }
+      
+      // Check for restart pending
+      if (restartPending && (millis() - restartTime >= 5000)) {
+        ESP.restart();
+      }
+      
+      xSemaphoreGive(ledMutex);
+    }
+    vTaskDelay(xDelay);
+  }
+}
+
 void setup() {
   // Initialize serial communication
   Serial.begin(115200);
-  Serial.println("Servo Control System Initializing...");
+  Serial.println("Servo Control System Initializing with FreeRTOS...");
   
   // Initialize LED
   pinMode(LED_PIN, OUTPUT);
-  turnLedOff(); // Start with LED off
+  digitalWrite(LED_PIN, HIGH); // Start with LED off
   
-  // Initial startup LED pattern - fast blink
-  setLedMode(100);
-  for (int i = 0; i < 10; i++) {
-    turnLedOn();
-    delay(100);
-    turnLedOff();
-    delay(100);
-  }
+  // Create mutexes
+  angleMutex = xSemaphoreCreateMutex();
+  wifiMutex = xSemaphoreCreateMutex();
+  ledMutex = xSemaphoreCreateMutex();
   
   // Initialize SPIFFS
   if (!SPIFFS.begin(true)) {
     Serial.println("An error occurred while mounting SPIFFS");
     // Error pattern - very fast blink
-    setLedMode(50);
+    ledBlinkInterval = 50;
     return;
   }
   Serial.println("SPIFFS mounted successfully");
@@ -351,7 +423,7 @@ void setup() {
   // Set servo to center position (90 degrees)
   setServoAngle(90);
   
-  // 初始化 MPU6050 传感器
+  // Initialize MPU6050 sensor
   mpuInitialized = initMPU6050();
   if (mpuInitialized) {
     Serial.println("MPU6050 initialized successfully");
@@ -380,6 +452,9 @@ void setup() {
     server.on("/", HTTP_GET, handleRoot);
     server.on("/setAngle", HTTP_GET, handleSetAngle);
     server.on("/getMeasuredAngle", HTTP_GET, handleGetMeasuredAngle);
+    
+    // Add static file handler for all other files
+    server.serveStatic("/", SPIFFS, "/");
   }
   
   // Start web server
@@ -399,19 +474,39 @@ void setup() {
     Serial.print("Then navigate to: http://");
     Serial.println(WiFi.softAPIP());
   }
+  
+  // Create FreeRTOS tasks
+  xTaskCreate(
+    webServerTask,    // Task function
+    "WebServerTask",  // Name for debugging
+    STACK_SIZE,       // Stack size (bytes)
+    NULL,             // Task parameters
+    WEBSERVER_TASK_PRIORITY,  // Priority (higher number = higher priority)
+    NULL              // Task handle
+  );
+  
+  xTaskCreate(
+    mpuTask,
+    "MPUTask",
+    STACK_SIZE,
+    NULL,
+    MPU_TASK_PRIORITY,
+    NULL
+  );
+  
+  xTaskCreate(
+    ledControlTask,
+    "LEDTask",
+    STACK_SIZE,
+    NULL,
+    LED_TASK_PRIORITY,
+    NULL
+  );
+  
+  // FreeRTOS is now running, main loop will not be used
 }
 
 void loop() {
-  server.handleClient();
-  // blinkLed(); // Update LED state
-    // 非阻塞重启检查
-  if (restartPending && millis() - restartTime >= 5000) {
-    ESP.restart();
-  }
-  // 周期性读取 MPU6050 数据
-  unsigned long currentMillis = millis();
-  if (mpuInitialized && (currentMillis - lastMpuReadTime >= MPU_READ_INTERVAL)) {
-    lastMpuReadTime = currentMillis;
-    readMPUAngle();
-  }
+  // Nothing to do here - FreeRTOS tasks are handling everything
+  vTaskDelay(portMAX_DELAY); // Prevent watchdog issues
 }
