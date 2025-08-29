@@ -3,6 +3,10 @@
 #include <WebServer.h>
 #include <EEPROM.h>
 #include <SPIFFS.h>
+// 添加 MPU6050 相关库
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+#include <Wire.h>
 
 // Servo control parameters
 #define SERVO_PIN 1         // GPIO 1 for servo control
@@ -21,6 +25,10 @@
 #define SERVO_MID_PULSE 307   // 1.5ms/20ms * 4095 ≈ 307 (90 degrees)
 #define SERVO_MAX_PULSE 512   // 2.5ms/20ms * 4095 ≈ 512 (180 degrees)
 
+// I2C pins for MPU6050
+#define SDA_PIN 5  // GPIO5 for SDA according to XIAO ESP32S3 pinout
+#define SCL_PIN 6  // GPIO6 for SCL according to XIAO ESP32S3 pinout
+
 // WiFi configuration
 #define EEPROM_SIZE 512
 #define MAX_SSID_LENGTH 32
@@ -37,6 +45,16 @@ bool wifiConfigured = false;
 unsigned long lastLedToggle = 0;
 int ledBlinkInterval = 1000; // Default blink interval
 bool ledState = false;       // LED state
+unsigned long restartTime = 0;
+bool restartPending = false;
+
+// 添加 MPU6050 相关全局变量
+Adafruit_MPU6050 mpu;
+unsigned long lastMpuReadTime = 0;
+const int MPU_READ_INTERVAL = 100;  // 读取间隔 (毫秒)
+float measuredAngle = 90;           // 初始值与舵机默认角度相同
+const float FILTER_FACTOR = 0.1;    // 平滑角度数据的滤波系数 (0-1)
+bool mpuInitialized = false;        // MPU6050 初始化状态
 
 // Structure to store WiFi configuration
 struct {
@@ -120,9 +138,52 @@ void setServoAngle(int angle) {
   
   Serial.print("Servo angle set to: ");
   Serial.print(angle);
-  Serial.print("(PWM value: ");
+  Serial.print(" (PWM value: ");
   Serial.print(pulse);
   Serial.println(")");
+}
+
+// MPU6050 初始化函数
+bool initMPU6050() {
+  // 使用指定的 SDA 和 SCL 引脚初始化 I2C
+  Wire.begin(SDA_PIN, SCL_PIN);
+  
+  if (!mpu.begin()) {
+    Serial.println("Failed to find MPU6050 chip");
+    return false;
+  }
+  
+  Serial.println("MPU6050 Found!");
+  
+  // 设置加速度计范围 (±2, 4, 8, or 16 G)
+  mpu.setAccelerometerRange(MPU6050_RANGE_2_G);
+  // 设置陀螺仪范围 (250, 500, 1000, or 2000 度/秒)
+  mpu.setGyroRange(MPU6050_RANGE_250_DEG);
+  // 设置滤波带宽 (5, 10, 21, 44, 94, 184, 260 Hz)
+  mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+  
+  delay(100);
+  return true;
+}
+
+// 读取 MPU6050 角度数据
+float readMPUAngle() {
+  if (!mpuInitialized) return measuredAngle;
+  
+  sensors_event_t a, g, temp;
+  mpu.getEvent(&a, &g, &temp);
+  
+  // 计算基于加速度计的倾角（假设安装方向与舵面方向匹配）
+  // 这里假设 MPU6050 的 X 轴与舵面旋转轴垂直
+  float angleX = atan2(a.acceleration.y, a.acceleration.z) * 180.0 / PI;
+  
+  // 应用低通滤波平滑数据
+  measuredAngle = measuredAngle * (1.0 - FILTER_FACTOR) + angleX * FILTER_FACTOR;
+  
+  // 映射到 0-180 度范围
+  float mappedAngle = map(constrain(measuredAngle, -90, 90), -90, 90, 0, 180);
+  
+  return mappedAngle;
 }
 
 // Load WiFi configuration from EEPROM
@@ -213,25 +274,34 @@ void handleWiFiConfig() {
   server.send(200, "text/html", html);
 }
 
+// 处理获取实际角度的请求
+void handleGetMeasuredAngle() {
+  float angle = readMPUAngle();
+  server.send(200, "application/json", "{\"angle\":" + String(angle, 1) + ", \"status\":" + String(mpuInitialized ? "true" : "false") + "}");
+}
+
 // Save WiFi configuration and try to connect
 void handleSaveWiFi() {
   String ssid = server.arg("ssid");
   String password = server.arg("password");
   
-  // Save configuration
-  strncpy(wifiConfig.ssid, ssid.c_str(), MAX_SSID_LENGTH);
-  strncpy(wifiConfig.password, password.c_str(), MAX_PASSWORD_LENGTH);
+  // Save configuration (添加安全保障：确保字符串以null结尾)
+  strncpy(wifiConfig.ssid, ssid.c_str(), MAX_SSID_LENGTH - 1);
+  wifiConfig.ssid[MAX_SSID_LENGTH - 1] = '\0';
+  
+  strncpy(wifiConfig.password, password.c_str(), MAX_PASSWORD_LENGTH - 1);
+  wifiConfig.password[MAX_PASSWORD_LENGTH - 1] = '\0';
+  
   wifiConfig.configured = true;
   saveWiFiConfig();
   
   String html = readFile("/wifi_save.html");
   server.send(200, "text/html", html);
   
-  // Set LED to fast blink to indicate restarting
+  // 设置重启标志而不是立即重启
+  restartTime = millis();
+  restartPending = true;
   setLedMode(100);
-  
-  delay(5000);
-  ESP.restart();
 }
 
 // Set servo angle handler
@@ -281,6 +351,14 @@ void setup() {
   // Set servo to center position (90 degrees)
   setServoAngle(90);
   
+  // 初始化 MPU6050 传感器
+  mpuInitialized = initMPU6050();
+  if (mpuInitialized) {
+    Serial.println("MPU6050 initialized successfully");
+  } else {
+    Serial.println("MPU6050 initialization failed - continuing without angle measurement");
+  }
+  
   // Load WiFi configuration
   loadWiFiConfig();
   
@@ -301,6 +379,7 @@ void setup() {
     // Set web server routes for STA mode
     server.on("/", HTTP_GET, handleRoot);
     server.on("/setAngle", HTTP_GET, handleSetAngle);
+    server.on("/getMeasuredAngle", HTTP_GET, handleGetMeasuredAngle);
   }
   
   // Start web server
@@ -325,4 +404,14 @@ void setup() {
 void loop() {
   server.handleClient();
   // blinkLed(); // Update LED state
+    // 非阻塞重启检查
+  if (restartPending && millis() - restartTime >= 5000) {
+    ESP.restart();
+  }
+  // 周期性读取 MPU6050 数据
+  unsigned long currentMillis = millis();
+  if (mpuInitialized && (currentMillis - lastMpuReadTime >= MPU_READ_INTERVAL)) {
+    lastMpuReadTime = currentMillis;
+    readMPUAngle();
+  }
 }

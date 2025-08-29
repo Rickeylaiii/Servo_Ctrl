@@ -57,44 +57,133 @@
       font-size: 24px;
       font-weight: bold;
     }
+    #measuredAngle {
+      font-size: 24px;
+      font-weight: bold;
+      color: #2980b9;
+      margin-top: 10px;
+    }
+    .status-box {
+      margin-top: 20px;
+      padding: 15px;
+      border-radius: 5px;
+      background-color: #f8f9fa;
+      border: 1px solid #dee2e6;
+    }
+    .error-small {
+      color: #4CAF50;
+    }
+    .error-medium {
+      color: #f39c12;
+    }
+    .error-large {
+      color: #e74c3c;
+    }
+    .sensor-status {
+      margin-top: 10px;
+      font-size: 14px;
+    }
+    .connected {
+      color: #4CAF50;
+    }
+    .disconnected {
+      color: #e74c3c;
+    }
   </style>
 </head>
 <body>
   <div class="container">
     <h1>Servo Control Panel</h1>
     <div class="control-panel">
-      <div id="currentAngle">Current Angle: %ANGLE%</div>
+      <div id="currentAngle">Target Angle: %ANGLE% </div>
+      <div id="measuredAngle">Measured Angle: Loading...</div>
       
       <div class="slider-container">
         <input type="range" min="0" max="180" value="%ANGLE%" id="angleSlider" oninput="updateAngle(this.value)">
         <div class="slider-labels">
-          <span>0</span>
-          <span>180</span>
+          <span>0 </span>
+          <span>180 </span>
         </div>
       </div>
       
       <div class="button-container">
-        <button onclick="setAngle(0)">0</button>
-        <button onclick="setAngle(45)">45</button>
-        <button onclick="setAngle(90)">90</button>
-        <button onclick="setAngle(135)">135</button>
-        <button onclick="setAngle(180)">180</button>
+        <button onclick="setAngle(0)">0 </button>
+        <button onclick="setAngle(45)">45 </button>
+        <button onclick="setAngle(90)">90 </button>
+        <button onclick="setAngle(135)">135 </button>
+        <button onclick="setAngle(180)">180 </button>
+      </div>
+      
+      <div class="status-box">
+        <div id="angleError">Angle Deviation: Calculating...</div>
+        <div id="sensorStatus" class="sensor-status">Sensor Status: Checking...</div>
       </div>
     </div>
   </div>
 
   <script>
     function updateAngle(angle) {
-      document.getElementById("currentAngle").innerHTML = "Current Angle: " + angle;
+      document.getElementById("currentAngle").innerHTML = "Target Angle: " + angle + " ";
       fetch("/setAngle?angle=" + angle)
         .then(response => response.text())
-        .then(data => console.log(data));
+        .then(data => console.log(data))
+        .catch(error => console.error("Error setting angle:", error));
     }
     
     function setAngle(angle) {
       document.getElementById("angleSlider").value = angle;
       updateAngle(angle);
     }
+    
+    // Fetch the measured angle from MPU6050 periodically
+    function fetchMeasuredAngle() {
+      fetch("/getMeasuredAngle")
+        .then(response => response.json())
+        .then(data => {
+          // Update measured angle
+          document.getElementById("measuredAngle").innerHTML = "Measured Angle: " + data.angle.toFixed(1) + " ";
+          
+          // Update sensor status
+          const statusElement = document.getElementById("sensorStatus");
+          if (data.status) {
+            statusElement.innerHTML = "Sensor Status: Connected";
+            statusElement.className = "sensor-status connected";
+          } else {
+            statusElement.innerHTML = "Sensor Status: Disconnected";
+            statusElement.className = "sensor-status disconnected";
+          }
+          
+          // Calculate and display angle deviation
+          const targetAngle = parseInt(document.getElementById("angleSlider").value);
+          const deviation = (data.angle - targetAngle).toFixed(1);
+          const errorElement = document.getElementById("angleError");
+          
+          errorElement.innerHTML = "Angle Deviation: " + deviation + " ";
+          
+          // Apply color coding based on deviation
+          const absDeviation = Math.abs(deviation);
+          if (absDeviation < 5) {
+            errorElement.className = "error-small";
+          } else if (absDeviation < 10) {
+            errorElement.className = "error-medium";
+          } else {
+            errorElement.className = "error-large";
+          }
+        })
+        .catch(error => {
+          console.error("Error fetching measured angle:", error);
+          document.getElementById("measuredAngle").innerHTML = "Measured Angle: Error";
+          document.getElementById("sensorStatus").innerHTML = "Sensor Status: Error";
+          document.getElementById("sensorStatus").className = "sensor-status disconnected";
+          document.getElementById("angleError").innerHTML = "Angle Deviation: N/A";
+        });
+    }
+    
+    // Fetch measured angle every second
+    setInterval(fetchMeasuredAngle, 1000);
+    
+    // Initial fetch on page load
+    document.addEventListener("DOMContentLoaded", fetchMeasuredAngle);
   </script>
 </body>
 </html>
