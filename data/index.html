@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Servo Control@Rickeylai</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      text-align: center;
+      margin: 20px;
+      background-color: #f0f0f0;
+    }
+    .container {
+      max-width: 800px;
+      margin: 0 auto;
+      background-color: white;
+      padding: 20px;
+      border-radius: 10px;
+      box-shadow: 0 0 10px rgba(0,0,0,0.1);
+    }
+    h1 {
+      color: #333;
+    }
+    .control-panel {
+      margin: 20px 0;
+    }
+    .slider-container {
+      margin: 20px auto;
+      width: 80%;
+    }
+    #angleSlider {
+      width: 100%;
+      margin: 10px 0;
+    }
+    .slider-labels {
+      display: flex;
+      justify-content: space-between;
+      width: 100%;
+      margin-top: 5px;
+    }
+    .button-container {
+      margin: 20px 0;
+    }
+    button {
+      background-color: #4CAF50;
+      color: white;
+      border: none;
+      padding: 10px 20px;
+      margin: 5px;
+      border-radius: 5px;
+      cursor: pointer;
+    }
+    button:hover {
+      background-color: #45a049;
+    }
+    #currentAngle {
+      font-size: 24px;
+      font-weight: bold;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>Servo Control Panel</h1>
+    <div class="control-panel">
+      <div id="currentAngle">Current Angle: %ANGLE%</div>
+      
+      <div class="slider-container">
+        <input type="range" min="0" max="180" value="%ANGLE%" id="angleSlider" oninput="updateAngle(this.value)">
+        <div class="slider-labels">
+          <span>0</span>
+          <span>180</span>
+        </div>
+      </div>
+      
+      <div class="button-container">
+        <button onclick="setAngle(0)">0</button>
+        <button onclick="setAngle(45)">45</button>
+        <button onclick="setAngle(90)">90</button>
+        <button onclick="setAngle(135)">135</button>
+        <button onclick="setAngle(180)">180</button>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    function updateAngle(angle) {
+      document.getElementById("currentAngle").innerHTML = "Current Angle: " + angle;
+      fetch("/setAngle?angle=" + angle)
+        .then(response => response.text())
+        .then(data => console.log(data));
+    }
+    
+    function setAngle(angle) {
+      document.getElementById("angleSlider").value = angle;
+      updateAngle(angle);
+    }
+  </script>
+</body>
+</html>

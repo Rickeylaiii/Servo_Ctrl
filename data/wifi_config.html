@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>WiFi Configuration</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      text-align: center;
+      margin: 20px;
+      background-color: #f0f0f0;
+    }
+    .container {
+      max-width: 800px;
+      margin: 0 auto;
+      background-color: white;
+      padding: 20px;
+      border-radius: 10px;
+      box-shadow: 0 0 10px rgba(0,0,0,0.1);
+    }
+    h1 {
+      color: #333;
+    }
+    .form-group {
+      margin: 15px 0;
+      text-align: left;
+    }
+    label {
+      display: block;
+      margin-bottom: 5px;
+      font-weight: bold;
+    }
+    input[type="text"], input[type="password"] {
+      width: 100%;
+      padding: 10px;
+      margin: 5px 0;
+      border: 1px solid #ddd;
+      border-radius: 4px;
+      box-sizing: border-box;
+    }
+    input[type="submit"] {
+      background-color: #4CAF50;
+      color: white;
+      border: none;
+      padding: 10px 20px;
+      margin-top: 10px;
+      border-radius: 5px;
+      cursor: pointer;
+    }
+    input[type="submit"]:hover {
+      background-color: #45a049;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>WiFi Configuration</h1>
+    <form action="/saveWiFi" method="post">
+      <div class="form-group">
+        <label for="ssid">WiFi Name (SSID):</label>
+        <input type="text" id="ssid" name="ssid" required>
+      </div>
+      <div class="form-group">
+        <label for="password">WiFi Password:</label>
+        <input type="password" id="password" name="password">
+      </div>
+      <input type="submit" value="Save and Connect">
+    </form>
+  </div>
+</body>
+</html>
