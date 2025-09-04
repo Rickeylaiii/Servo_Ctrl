@@ -42,7 +42,7 @@
 #define WEBSERVER_TASK_PRIORITY 3
 #define MPU_TASK_PRIORITY 2
 #define LED_TASK_PRIORITY 1
-#define STACK_SIZE 4096
+#define STACK_SIZE 8192
 
 // Web server
 WebServer server(80);
