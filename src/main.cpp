@@ -6,6 +6,7 @@
 #include <Adafruit_MPU6050.h>
 #include <Adafruit_Sensor.h>
 #include <Wire.h>
+#include <SimpleKalmanFilter.h>  // Add SimpleKalmanFilter library
 
 // Add FreeRTOS includes
 #include "freertos/FreeRTOS.h"
@@ -61,8 +62,13 @@ unsigned long restartTime = 0;
 // MPU6050 variables
 Adafruit_MPU6050 mpu;
 float measuredAngle = 90;           // Initial value matching default servo angle
-const float FILTER_FACTOR = 0.25;    // Low-pass filter coefficient (0-1)
+// const float FILTER_FACTOR = 0.25;    // No longer needed - using Kalman filter
 bool mpuInitialized = false;        // MPU6050 initialization status
+
+// Kalman filter variables
+SimpleKalmanFilter kalmanX(1, 1, 0.01);  // SimpleKalmanFilter(e_mea, e_est, q)
+float gyroXoffset = 0;              // Gyroscope zero drift compensation
+unsigned long timer;                // Timer for calculating dt between readings
 
 // FreeRTOS synchronization
 SemaphoreHandle_t angleMutex;
@@ -185,10 +191,33 @@ bool initMPU6050() {
   mpu.setFilterBandwidth(MPU6050_BAND_44_HZ);
   
   vTaskDelay(pdMS_TO_TICKS(100));
+  
+  // Calibrate gyroscope - calculate zero drift offset
+  Serial.println("Calibrating gyroscope, keep the sensor still...");
+  for (int i = 0; i < 2000; i++) {
+    sensors_event_t a, g, temp;
+    mpu.getEvent(&a, &g, &temp);
+    gyroXoffset += g.gyro.x;
+    vTaskDelay(pdMS_TO_TICKS(1));
+  }
+  gyroXoffset /= 2000;
+  Serial.print("Gyro X offset: ");
+  Serial.println(gyroXoffset);
+  
+  // Get initial angle from accelerometer for Kalman filter
+  sensors_event_t a, g, temp;
+  mpu.getEvent(&a, &g, &temp);
+  float initialAngle = atan2(a.acceleration.y, a.acceleration.z) * 180.0 / PI;
+  // SimpleKalmanFilter doesn't need explicit initialization with angle
+  
+  // Initialize timer for dt calculation
+  timer = micros();
+  
+  Serial.println("Kalman filter initialized");
   return true;
 }
 
-// Read MPU6050 angle data
+// Read MPU6050 angle data using SimpleKalmanFilter
 float readMPUAngle() {
   if (!mpuInitialized) return measuredAngle;
   
@@ -198,11 +227,12 @@ float readMPUAngle() {
     sensors_event_t a, g, temp;
     mpu.getEvent(&a, &g, &temp);
     
-    // Calculate tilt angle based on accelerometer data
-    float angleX = atan2(a.acceleration.y, a.acceleration.z) * 180.0 / PI;
+    // Calculate angle from accelerometer (noisy but no long-term drift)
+    float accAngleX = atan2(a.acceleration.y, a.acceleration.z) * 180.0 / PI;
     
-    // Apply low-pass filter for smoother readings
-    measuredAngle = measuredAngle * (1.0 - FILTER_FACTOR) + angleX * FILTER_FACTOR;
+    // Use SimpleKalmanFilter to smooth the accelerometer reading
+    // Note: This library is simpler and doesn't use gyroscope data directly
+    measuredAngle = kalmanX.updateEstimate(accAngleX);
     
     // Map to 0-180 degree range
     result = mapFloat(constrain(measuredAngle, -90.0f, 90.0f), -90.0f, 90.0f, 0.0f, 180.0f);
